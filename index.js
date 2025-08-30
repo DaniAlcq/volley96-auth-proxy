@@ -1,151 +1,106 @@
-// index.js
+// index.js  — OAuth flow per Decap/Netlify CMS (GitHub)
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
-import crypto from 'crypto';
-import cookieParser from 'cookie-parser';
 
 const app = express();
 app.use(express.json());
-app.use(cookieParser());
 
-// ====== CONFIG ======
 const {
   GITHUB_CLIENT_ID,
   GITHUB_CLIENT_SECRET,
-  REPO_FULL_NAME,            // es: "DaniAlcq/asd-volley-96" (facoltativo)
-  ALLOWED_ORIGIN,            // es: "https://danialcq.github.io"
-  COOKIE_SECRET = 'cms_oauth_cookie_secret'
+  ALLOWED_ORIGIN,   // es: https://danialcq.github.io
 } = process.env;
 
-// CORS: consenti il tuo sito (l'origin è schema+host+porta, niente path)
+// CORS (serve solo per eventuali chiamate XHR; il popup non ne ha bisogno)
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);             // per richieste server-to-server
-    if (!ALLOWED_ORIGIN) return cb(null, true);      // permissivo finché configuri
-    if (origin === ALLOWED_ORIGIN) return cb(null, true);
-    return cb(new Error(`Origin non consentito: ${origin}`));
-  },
+  origin: (origin, cb) => cb(null, true),
   credentials: true
 }));
 
-// Utility per state anti-CSRF
-function makeState() {
-  return crypto.randomBytes(16).toString('hex');
-}
+app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up'));
 
-// Health
-app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up (OAuth web flow)'));
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    hasClientId: !!GITHUB_CLIENT_ID,
-    hasSecret: !!GITHUB_CLIENT_SECRET,
-    repo: REPO_FULL_NAME || null,
-    allowedOrigin: ALLOWED_ORIGIN || '* (dev)'
-  });
+// Avvia login: Decap chiamerà /auth?provider=github&scope=repo
+app.get('/auth', (req, res) => {
+  const provider = req.query.provider || 'github';
+  if (provider !== 'github') return res.status(400).send('Unsupported provider');
+
+  const scope = req.query.scope || 'repo';
+  const redirectUri = `${req.protocol}://${req.get('host')}/callback`;
+
+  const authorizeUrl = new URL('https://github.com/login/oauth/authorize');
+  authorizeUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
+  authorizeUrl.searchParams.set('scope', scope);
+  authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+
+  // facoltativo: state
+  // authorizeUrl.searchParams.set('state', 'abc123');
+
+  res.redirect(authorizeUrl.toString());
 });
 
-/**
- * 1) Avvio login: reindirizza a GitHub OAuth authorize
- *    Decap CMS aprirà questo endpoint in un popup.
- *    Query utili: ?origin=<url admin> (Decap la passa; la teniamo per sicurezza)
- */
-app.get('/auth/github', (req, res) => {
-  try {
-    const origin = req.query.origin || ALLOWED_ORIGIN; // es. https://danialcq.github.io
-    if (!origin) {
-      return res.status(400).send('Missing origin (configura ALLOWED_ORIGIN o passa ?origin=...)');
-    }
-
-    // genera state e salvalo in cookie (httpOnly false perché usiamo popup; va bene per questo caso)
-    const state = makeState();
-    res.cookie('oauth_state', state, { httpOnly: true, sameSite: 'lax', secure: true });
-    res.cookie('cms_origin', origin, { httpOnly: true, sameSite: 'lax', secure: true });
-
-    const params = new URLSearchParams({
-      client_id: GITHUB_CLIENT_ID,
-      scope: 'repo',
-      state,
-      // Deve puntare al tuo /callback pubblico
-      redirect_uri: `https://${req.get('host')}/callback`
-    });
-
-    const authorizeUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
-    return res.redirect(authorizeUrl);
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('auth init failed');
-  }
-});
-
-/**
- * 2) Callback da GitHub: scambia code -> access_token e “consegna” il token al CMS
- *    tramite postMessage dal popup verso la finestra principale, poi chiude il popup.
- */
+// Callback da GitHub: scambia code -> access_token e postMessage al parent
 app.get('/callback', async (req, res) => {
   try {
-    const { code, state } = req.query;
-    const savedState = req.cookies.oauth_state;
-    const origin = req.cookies.cms_origin || ALLOWED_ORIGIN;
+    const code = req.query.code;
+    if (!code) return res.status(400).send('Missing code');
 
-    if (!code || !state) return res.status(400).send('Missing code/state');
-    if (state !== savedState) return res.status(400).send('Invalid state');
-
-    // scambia code per access_token
+    // Scambio code per token
     const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
-      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify({
         client_id: GITHUB_CLIENT_ID,
         client_secret: GITHUB_CLIENT_SECRET,
-        code,
-        redirect_uri: `https://${req.get('host')}/callback`,
-        state
+        code
       })
     });
     const tokenData = await tokenResp.json();
 
     if (!tokenResp.ok || tokenData.error || !tokenData.access_token) {
-      console.error('Token exchange error:', tokenData);
-      return res.status(400).send('Token exchange failed');
+      console.error('token error:', tokenData);
+      return res.send(renderPopupResult({ ok: false, message: tokenData.error_description || 'OAuth failed' }));
     }
 
-    const accessToken = tokenData.access_token;
-
-    // Pagina HTML che comunica il token al CMS e chiude il popup
-    // Decap si aspetta un postMessage con { token, provider: 'github' }
-    const target = origin || '*';
-    const html = `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>GitHub OAuth Done</title></head>
-<body>
-<script>
-  (function(){
-    try {
-      var data = { token: ${JSON.stringify(accessToken)}, provider: 'github' };
-      if (window.opener) {
-        window.opener.postMessage(data, ${JSON.stringify(target)});
-        window.close();
-      } else if (window.parent) {
-        window.parent.postMessage(data, ${JSON.stringify(target)});
-      }
-    } catch(e) {
-      console.error(e);
-    }
-  })();
-</script>
-<p>Login completato. Puoi chiudere questa finestra.</p>
-</body>
-</html>`;
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.send(html);
+    // Successo → manda messaggio al window.opener come si aspetta Decap
+    return res.send(renderPopupResult({ ok: true, token: tokenData.access_token, origin: ALLOWED_ORIGIN }));
   } catch (e) {
     console.error(e);
-    res.status(500).send('callback failed');
+    res.send(renderPopupResult({ ok: false, message: 'Unexpected error' }));
   }
 });
 
+function renderPopupResult({ ok, token, message, origin }) {
+  // NB: Decap ascolta postMessage "authorization:github:success:<token>" oppure "authorization:github:error:<msg>"
+  // origin: se vuoi limitare, metti l’origin del tuo sito; altrimenti usa "*"
+  const targetOrigin = origin || '*';
+  const payload = ok ? `authorization:github:success:${token}` : `authorization:github:error:${message || 'Error'}`;
+
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Auth</title></head>
+<body>
+<script>
+  (function() {
+    function send() {
+      try {
+        window.opener.postMessage('${payload}', '${targetOrigin}');
+      } catch (e) {
+        // fallback
+        window.opener && window.opener.postMessage('${payload}', '*');
+      }
+      window.close();
+    }
+    // Netlify/Decap invia prima "authorizing:github" per handshake,
+    // ma possiamo inviare noi direttamente il risultato:
+    send();
+  })();
+</script>
+Chiudi questa finestra...
+</body>
+</html>`;
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Auth proxy listening on :${PORT}`));
+app.listen(PORT, () => console.log('Auth proxy on :' + PORT));
