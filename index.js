@@ -91,23 +91,30 @@ app.get('/callback', async (req, res) => {
 });
 
 // ===== Paginetta che fa postMessage all’opener e chiude la popup =====
+// --- popup result: postMessage in due formati (string e JSON) ---
 function renderPopupResult({ ok, token, message }) {
-  const payload = ok
-    ? `authorization:github:success:${token}`
-    : `authorization:github:error:${message || 'Error'}`;
-
-  // NB: targetOrigin '*' per evitare mismatch di origin durante debug
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
-<body><script>
-(function(){
-  try { window.opener.postMessage('${payload}', '*'); } catch(e) {}
-  window.close();
-})();
-</script>
-<p>Puoi chiudere questa finestra.</p></body></html>`;
-}
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('🚀 Auth proxy listening on :' + PORT);
-});
+    const payloadStr = ok
+      ? `authorization:github:success:${token}`
+      : `authorization:github:error:${message || 'Error'}`;
+  
+    const payloadObj = ok
+      ? { type: 'authorization', provider: 'github', status: 'success', token }
+      : { type: 'authorization', provider: 'github', status: 'error', message: message || 'Error' };
+  
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
+  <body><script>
+  (function(){
+    try {
+      // forma stringa (vecchie versioni)
+      window.opener && window.opener.postMessage(${JSON.stringify(payloadStr)}, '*');
+    } catch(e) {}
+    try {
+      // forma oggetto (alcune build recenti)
+      window.opener && window.opener.postMessage(${JSON.stringify(payloadObj)}, '*');
+    } catch(e) {}
+    window.close();
+  })();
+  </script>
+  <p>Puoi chiudere questa finestra.</p></body></html>`;
+  }
+  
