@@ -1,64 +1,121 @@
-const express = require("express");
-const fetch = require("node-fetch");
-const dotenv = require("dotenv");
-const cors = require("cors");
-
-dotenv.config();
+// index.js
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
 
 const app = express();
-app.use(cors());
+app.use(express.json());
 
-// Variabili d'ambiente
-const CLIENT_ID = process.env.GITHUB_CLIENT_ID;
-const CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
-const REPO = process.env.REPO_FULL_NAME;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN;
+// CORS: consenti l'origin del tuo sito GitHub Pages
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN; // es. https://danialcq.github.io/asd-volley-96
+app.use(cors({
+  origin: (origin, cb) => cb(null, true), // per debug; poi restringi a ALLOWED_ORIGIN
+  credentials: true
+}));
 
-// Middleware CORS
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.header("Access-Control-Allow-Headers", "Content-Type");
-  next();
-});
+// Env richieste
+const {
+  GITHUB_CLIENT_ID,
+  GITHUB_CLIENT_SECRET,
+  REPO_FULL_NAME // "DaniAlcq/asd-volley-96"
+} = process.env;
 
-// Endpoint login con GitHub
-app.get("/auth", (req, res) => {
-  const redirect = `https://github.com/login/oauth/authorize?client_id=${CLIENT_ID}&scope=repo,user&redirect_uri=${process.env.BASE_URL}/callback`;
-  res.redirect(redirect);
-});
+// Health / root
+app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up'));
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  hasClientId: !!GITHUB_CLIENT_ID,
+  hasSecret: !!GITHUB_CLIENT_SECRET,
+  repo: REPO_FULL_NAME,
+  allowedOrigin: ALLOWED_ORIGIN
+}));
 
-// Callback GitHub
-app.get("/callback", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send("Code mancante");
-
+/**
+ * Avvio login per Netlify CMS (Github backend) via GitHub Device Flow.
+ * Netlify CMS chiamerà: GET /auth/github?origin=<URL admin>
+ * Rispondiamo con JSON nel formato atteso dal backend github del CMS:
+ * { "token": "<device_code>", "provider": "github" }
+ * (il CMS mostrerà l'UI per completare l'autorizzazione)
+ */
+app.get('/auth/github', async (req, res) => {
   try {
-    const response = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        code
-      })
+    const origin = req.query.origin; // es. https://danialcq.github.io/asd-volley-96/admin/
+    if (!origin) return res.status(400).json({ error: 'missing origin' });
+
+    // Richiesta device code a GitHub
+    const deviceResp = await fetch('https://github.com/login/device/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, scope: 'repo' })
     });
+    const deviceData = await deviceResp.json();
 
-    const data = await response.json();
-
-    if (data.error) {
-      return res.status(400).json(data);
+    if (!deviceResp.ok) {
+      console.error('Device code error:', deviceData);
+      return res.status(500).json({ error: 'device_code_failed', details: deviceData });
     }
 
-    res.json(data);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Errore server");
+    // Ritorna al CMS il device_code come "token"
+    // (Il CMS gestirà il polling verso /auth/github/callback per scambiare il token)
+    res.json({
+      provider: 'github',
+      token: deviceData.device_code,
+      // Extra facoltativi per debug
+      verification_uri: deviceData.verification_uri,
+      user_code: deviceData.user_code,
+      expires_in: deviceData.expires_in,
+      interval: deviceData.interval
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'auth_init_failed' });
   }
 });
 
-// Porta dinamica per Render
+/**
+ * Endpoint che il CMS userà per scambiare il device_code con l'access token.
+ * Netlify CMS (github backend) di solito fa POST qui con { token: device_code }.
+ */
+app.post('/auth/github/callback', express.json(), async (req, res) => {
+  try {
+    const { token: device_code } = req.body || {};
+    if (!device_code) return res.status(400).json({ error: 'missing device_code' });
+
+    // Poll token
+    const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        device_code,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
+      })
+    });
+    const tokenData = await tokenResp.json();
+
+    if (!tokenResp.ok || tokenData.error) {
+      console.error('Token exchange error:', tokenData);
+      return res.status(400).json(tokenData);
+    }
+
+    // Ritorna al CMS l'access_token
+    res.json({
+      token: tokenData.access_token,
+      provider: 'github'
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'token_exchange_failed' });
+  }
+});
+
+// Facoltativo: compatibilità con config che punta a /callback (GET)
+app.get('/callback', (req, res) => {
+  res.send('Callback ok (non usata nel device flow).');
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy attivo su porta ${PORT}`));
-// Health & root
-app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up'));
-app.get('/health', (req, res) => res.json({ ok: true, env: ['CLIENT_ID', !!process.env.GITHUB_CLIENT_ID, 'ORIGIN', process.env.ALLOWED_ORIGIN?.length > 0] }));
+app.listen(PORT, () => {
+  console.log(`Auth proxy listening on :${PORT}`);
+});
