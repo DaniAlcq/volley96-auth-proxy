@@ -7,38 +7,45 @@ const app = express();
 app.use(express.json());
 app.set('trust proxy', 1);
 
+// ===== Env =====
 const {
   GITHUB_CLIENT_ID,
   GITHUB_CLIENT_SECRET,
-  ALLOWED_ORIGIN,               // es: https://danialcq.github.io
+  ALLOWED_ORIGIN,               // es: https://danialcq.github.io  (NO /asd-volley-96)
   CALLBACK_URL                  // es: https://volley96-auth-proxy.onrender.com/callback
 } = process.env;
 
-const allowedOrigin = ALLOWED_ORIGIN || 'https://danialcq.github.io';
+// Prende solo origin (schema+host+porta), elimina eventuale path
+function originOnly(url) {
+  try { return new URL(url).origin; } catch { return url || ''; }
+}
+const ORIGIN = originOnly(ALLOWED_ORIGIN) || 'https://danialcq.github.io';
 
-// CORS: consenti solo il dominio del sito
+// ===== CORS =====
 app.use(cors({
-  origin: allowedOrigin,
-  credentials: true
+  origin: (requestOrigin, cb) => {
+    // consenti richieste senza origin (es. curl) e l’origin previsto
+    if (!requestOrigin || originOnly(requestOrigin) === ORIGIN) return cb(null, true);
+    return cb(new Error('Origin not allowed'), false);
+  },
+  credentials: true,
 }));
 
-// Health check
-app.get('/', (req, res) => res.send('✅ volley96-auth-proxy up'));
+// ===== Health =====
+app.get('/', (_req, res) => res.send('✅ volley96-auth-proxy up'));
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
     clientId: !!GITHUB_CLIENT_ID,
     secret: !!GITHUB_CLIENT_SECRET,
-    allowedOrigin,
+    allowedOriginEnv: ALLOWED_ORIGIN || null,
+    allowedOriginEffective: ORIGIN,
     callbackUrl: CALLBACK_URL || `${req.protocol}://${req.get('host')}/callback`
   });
 });
 
-/**
- * STEP 1 — Avvio login
- * Decap chiama /auth?provider=github&scope=repo&site_id=xxx
- * Noi lo redirigiamo a GitHub OAuth
- */
+// ===== STEP 1 — Avvio login =====
+// Decap chiama /auth?provider=github&scope=repo&site_id=...
 app.get('/auth', (req, res) => {
   const scope = req.query.scope || 'repo';
   const redirectUri = CALLBACK_URL || `${req.protocol}://${req.get('host')}/callback`;
@@ -48,14 +55,10 @@ app.get('/auth', (req, res) => {
   authorizeUrl.searchParams.set('scope', scope);
   authorizeUrl.searchParams.set('redirect_uri', redirectUri);
 
-  return res.redirect(authorizeUrl.toString());
+  res.redirect(authorizeUrl.toString());
 });
 
-/**
- * STEP 2 — Callback da GitHub
- * GitHub ci restituisce il "code", noi lo scambiamo con l’access_token
- * Poi mandiamo il token a Decap CMS via postMessage
- */
+// ===== STEP 2 — Callback GitHub =====
 app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
@@ -76,29 +79,28 @@ app.get('/callback', async (req, res) => {
       console.error('❌ token exchange error:', tokenData);
       return res.send(renderPopupResult({
         ok: false,
-        message: tokenData.error_description || 'OAuth failed',
-        origin: allowedOrigin
+        message: tokenData.error_description || tokenData.error || 'OAuth failed',
+        origin: ORIGIN
       }));
     }
 
     return res.send(renderPopupResult({
       ok: true,
       token: tokenData.access_token,
-      origin: allowedOrigin
+      origin: ORIGIN
     }));
   } catch (e) {
     console.error('❌ callback error:', e);
-    res.send(renderPopupResult({ ok: false, message: 'Unexpected error', origin: allowedOrigin }));
+    res.send(renderPopupResult({ ok: false, message: 'Unexpected error', origin: ORIGIN }));
   }
 });
 
-/**
- * Utility: restituisce una pagina che comunica a Decap il risultato
- */
+// ===== Paginetta che parla con la finestra del CMS =====
 function renderPopupResult({ ok, token, message, origin }) {
   const payload = ok
     ? `authorization:github:success:${token}`
     : `authorization:github:error:${message || 'Error'}`;
+  const targetOrigin = originOnly(origin) || '*';
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
@@ -106,8 +108,10 @@ function renderPopupResult({ ok, token, message, origin }) {
 <script>
   (function() {
     try {
-      window.opener.postMessage('${payload}', '${origin}');
+      // Manda il token alla finestra del CMS
+      window.opener && window.opener.postMessage('${payload}', '${targetOrigin}');
     } catch(e) {
+      // Ultimo fallback
       window.opener && window.opener.postMessage('${payload}', '*');
     }
     window.close();
