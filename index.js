@@ -1,3 +1,4 @@
+// index.js — OAuth flow per Decap CMS (GitHub)
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -9,44 +10,54 @@ app.set('trust proxy', 1);
 const {
   GITHUB_CLIENT_ID,
   GITHUB_CLIENT_SECRET,
-  ALLOWED_ORIGIN,
-  CALLBACK_URL
+  ALLOWED_ORIGIN,   // es: https://danialcq.github.io/asd-volley-96
+  CALLBACK_URL      // es: https://volley96-auth-proxy.onrender.com/callback
 } = process.env;
 
-const allowedOrigin = ALLOWED_ORIGIN || 'https://danialcq.github.io';
+const allowedOrigin = ALLOWED_ORIGIN || 'https://danialcq.github.io/asd-volley-96';
 
-app.use(cors({ origin: allowedOrigin, credentials: true }));
+// CORS: consenti solo il dominio del sito
+app.use(cors({
+  origin: allowedOrigin,
+  credentials: true
+}));
 
-app.get('/', (_req, res) => res.send('✅ volley96-auth-proxy up'));
-app.get('/health', (_req, res) => {
+// Health check
+app.get('/', (req, res) => res.send('✅ volley96-auth-proxy up'));
+app.get('/health', (req, res) => {
   res.json({
     ok: true,
     clientId: !!GITHUB_CLIENT_ID,
     secret: !!GITHUB_CLIENT_SECRET,
     allowedOrigin,
-    callbackUrl: CALLBACK_URL || 'N/A'
+    callbackUrl: CALLBACK_URL || `${req.protocol}://${req.get('host')}/callback`
   });
 });
 
-// --- OAuth avvio
+/**
+ * STEP 1 — Avvio login
+ */
 app.get('/auth', (req, res) => {
   const scope = req.query.scope || 'repo';
   const redirectUri = CALLBACK_URL || `${req.protocol}://${req.get('host')}/callback`;
 
-  const u = new URL('https://github.com/login/oauth/authorize');
-  u.searchParams.set('client_id', GITHUB_CLIENT_ID);
-  u.searchParams.set('scope', scope);
-  u.searchParams.set('redirect_uri', redirectUri);
-  res.redirect(u.toString());
+  const authorizeUrl = new URL('https://github.com/login/oauth/authorize');
+  authorizeUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
+  authorizeUrl.searchParams.set('scope', scope);
+  authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+
+  return res.redirect(authorizeUrl.toString());
 });
 
-// --- OAuth callback
+/**
+ * STEP 2 — Callback da GitHub
+ */
 app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
-    if (!code) return res.status(400).send('❌ Missing code');
+    if (!code) return res.status(400).send('❌ Missing code from GitHub');
 
-    const r = await fetch('https://github.com/login/oauth/access_token', {
+    const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify({
@@ -55,41 +66,54 @@ app.get('/callback', async (req, res) => {
         code
       })
     });
-    const data = await r.json();
-    if (!r.ok || data.error || !data.access_token) {
-      console.error('token exchange error:', data);
-      return res.send(renderPopupResult({ ok: false, message: data.error_description || 'OAuth failed' }));
+    const tokenData = await tokenResp.json();
+
+    if (!tokenResp.ok || tokenData.error || !tokenData.access_token) {
+      console.error('❌ token exchange error:', tokenData);
+      return res.send(renderPopupResult({
+        ok: false,
+        message: tokenData.error_description || 'OAuth failed',
+        origin: allowedOrigin
+      }));
     }
-    return res.send(renderPopupResult({ ok: true, token: data.access_token }));
+
+    return res.send(renderPopupResult({
+      ok: true,
+      token: tokenData.access_token,
+      origin: allowedOrigin
+    }));
   } catch (e) {
-    console.error('callback error:', e);
-    res.send(renderPopupResult({ ok: false, message: 'Unexpected error' }));
+    console.error('❌ callback error:', e);
+    res.send(renderPopupResult({ ok: false, message: 'Unexpected error', origin: allowedOrigin }));
   }
 });
 
-// --- popup result: postMessage SEMPRE con '*'
-function renderPopupResult({ ok, token, message }) {
+/**
+ * Utility — restituisce una pagina che comunica a Decap il risultato
+ */
+function renderPopupResult({ ok, token, message, origin }) {
   const payload = ok
     ? `authorization:github:success:${token}`
     : `authorization:github:error:${message || 'Error'}`;
 
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
-<body><script>
-(function(){
- try {
-  window.opener.postMessage('${payload}', '${allowedOrigin}');
-} catch(e) {
-  // fallback per debug (non serve in produzione)
-  window.opener && window.opener.postMessage('${payload}', '*');
-}
-window.close();
-
+  return `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Auth Proxy</title></head>
+<body>
+<script>
+(function() {
+  try {
+    window.opener.postMessage('${payload}', '${origin}');
+  } catch(e) {
+    window.opener && window.opener.postMessage('${payload}', '*');
+  }
+  window.close();
 })();
 </script>
-<p>Puoi chiudere questa finestra.</p></body></html>`;
+<p>Puoi chiudere questa finestra.</p>
+</body>
+</html>`;
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('🚀 Auth proxy listening on :' + PORT);
-});
+app.listen(PORT, () => console.log('🚀 Auth proxy listening on :' + PORT));
