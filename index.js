@@ -5,8 +5,6 @@ import fetch from 'node-fetch';
 
 const app = express();
 app.use(express.json());
-
-// fidati del proxy (X-Forwarded-Proto) se serve
 app.set('trust proxy', 1);
 
 const {
@@ -16,20 +14,31 @@ const {
   CALLBACK_URL                  // es: https://volley96-auth-proxy.onrender.com/callback
 } = process.env;
 
-app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true }));
+const allowedOrigin = ALLOWED_ORIGIN || 'https://danialcq.github.io';
 
-app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up'));
+// CORS: consenti solo il dominio del sito
+app.use(cors({
+  origin: allowedOrigin,
+  credentials: true
+}));
+
+// Health check
+app.get('/', (req, res) => res.send('✅ volley96-auth-proxy up'));
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
     clientId: !!GITHUB_CLIENT_ID,
     secret: !!GITHUB_CLIENT_SECRET,
-    allowedOrigin: ALLOWED_ORIGIN || null,
-    callbackUrl: CALLBACK_URL || null
+    allowedOrigin,
+    callbackUrl: CALLBACK_URL || `${req.protocol}://${req.get('host')}/callback`
   });
 });
 
-// Avvio login (Decap chiamerà /auth?provider=github&scope=repo)
+/**
+ * STEP 1 — Avvio login
+ * Decap chiama /auth?provider=github&scope=repo&site_id=xxx
+ * Noi lo redirigiamo a GitHub OAuth
+ */
 app.get('/auth', (req, res) => {
   const scope = req.query.scope || 'repo';
   const redirectUri = CALLBACK_URL || `${req.protocol}://${req.get('host')}/callback`;
@@ -38,14 +47,19 @@ app.get('/auth', (req, res) => {
   authorizeUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
   authorizeUrl.searchParams.set('scope', scope);
   authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+
   return res.redirect(authorizeUrl.toString());
 });
 
-// Callback da GitHub: scambia code -> token e manda postMessage a Decap
+/**
+ * STEP 2 — Callback da GitHub
+ * GitHub ci restituisce il "code", noi lo scambiamo con l’access_token
+ * Poi mandiamo il token a Decap CMS via postMessage
+ */
 app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
-    if (!code) return res.status(400).send('Missing code');
+    if (!code) return res.status(400).send('❌ Missing code from GitHub');
 
     const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
@@ -59,40 +73,49 @@ app.get('/callback', async (req, res) => {
     const tokenData = await tokenResp.json();
 
     if (!tokenResp.ok || tokenData.error || !tokenData.access_token) {
-      console.error('token error:', tokenData);
-      return res.send(renderPopupResult({ ok: false, message: tokenData.error_description || 'OAuth failed' }));
+      console.error('❌ token exchange error:', tokenData);
+      return res.send(renderPopupResult({
+        ok: false,
+        message: tokenData.error_description || 'OAuth failed',
+        origin: allowedOrigin
+      }));
     }
 
     return res.send(renderPopupResult({
       ok: true,
       token: tokenData.access_token,
-      origin: ALLOWED_ORIGIN || '*'
+      origin: allowedOrigin
     }));
   } catch (e) {
-    console.error(e);
-    res.send(renderPopupResult({ ok: false, message: 'Unexpected error' }));
+    console.error('❌ callback error:', e);
+    res.send(renderPopupResult({ ok: false, message: 'Unexpected error', origin: allowedOrigin }));
   }
 });
 
+/**
+ * Utility: restituisce una pagina che comunica a Decap il risultato
+ */
 function renderPopupResult({ ok, token, message, origin }) {
-  const targetOrigin = origin || '*';
   const payload = ok
     ? `authorization:github:success:${token}`
     : `authorization:github:error:${message || 'Error'}`;
 
   return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Auth</title></head>
+<html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
 <body>
 <script>
   (function() {
-    try { window.opener.postMessage('${payload}', '${targetOrigin}'); }
-    catch(e) { window.opener && window.opener.postMessage('${payload}', '*'); }
+    try {
+      window.opener.postMessage('${payload}', '${origin}');
+    } catch(e) {
+      window.opener && window.opener.postMessage('${payload}', '*');
+    }
     window.close();
   })();
 </script>
-Chiudi questa finestra...
+<p>Puoi chiudere questa finestra.</p>
 </body></html>`;
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Auth proxy on :' + PORT));
+app.listen(PORT, () => console.log('🚀 Auth proxy listening on :' + PORT));
