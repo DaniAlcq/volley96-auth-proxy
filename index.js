@@ -76,8 +76,14 @@ function renderPopupResult({ ok, token, message }) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
 <body><script>
 (function(){
-  try { window.opener.postMessage('${payload}', '*'); } catch(e) {}
-  window.close();
+ try {
+  window.opener.postMessage('${payload}', '${allowedOrigin}');
+} catch(e) {
+  // fallback per debug (non serve in produzione)
+  window.opener && window.opener.postMessage('${payload}', '*');
+}
+window.close();
+
 })();
 </script>
 <p>Puoi chiudere questa finestra.</p></body></html>`;
