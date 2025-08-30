@@ -96,30 +96,24 @@ app.get('/callback', async (req, res) => {
 });
 
 // ===== Paginetta che parla con la finestra del CMS =====
-function renderPopupResult({ ok, token, message, origin }) {
-  const payload = ok
-    ? `authorization:github:success:${token}`
-    : `authorization:github:error:${message || 'Error'}`;
-  const targetOrigin = originOnly(origin) || '*';
-
-  return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
-<body>
-<script>
-  (function() {
-    try {
-      // Manda il token alla finestra del CMS
-      window.opener && window.opener.postMessage('${payload}', '${targetOrigin}');
-    } catch(e) {
-      // Ultimo fallback
-      window.opener && window.opener.postMessage('${payload}', '*');
-    }
-    window.close();
-  })();
-</script>
-<p>Puoi chiudere questa finestra.</p>
-</body></html>`;
-}
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('🚀 Auth proxy listening on :' + PORT));
+function renderPopupResult({ ok, token, message }) {
+    const payload = ok
+      ? `authorization:github:success:${token}`
+      : `authorization:github:error:${message || 'Error'}`;
+  
+    return `<!DOCTYPE html>
+  <html><head><meta charset="utf-8"><title>Auth Proxy</title></head>
+  <body>
+  <script>
+    (function() {
+      // Invia SEMPRE al window.opener con targetOrigin '*'
+      try { window.opener.postMessage('${payload}', '*'); }
+      catch(e) { /* ignore */ }
+      // Chiudi la popup
+      window.close();
+    })();
+  </script>
+  <p>Puoi chiudere questa finestra.</p>
+  </body></html>`;
+  }
+  
