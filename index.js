@@ -59,3 +59,6 @@ app.get("/callback", async (req, res) => {
 // Porta dinamica per Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy attivo su porta ${PORT}`));
+// Health & root
+app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up'));
+app.get('/health', (req, res) => res.json({ ok: true, env: ['CLIENT_ID', !!process.env.GITHUB_CLIENT_ID, 'ORIGIN', process.env.ALLOWED_ORIGIN?.length > 0] }));
