@@ -2,126 +2,150 @@
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
+import crypto from 'crypto';
+import cookieParser from 'cookie-parser';
 
 const app = express();
 app.use(express.json());
+app.use(cookieParser());
 
-// CORS: consenti solo l'origin del tuo sito GitHub Pages
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN; // es. https://danialcq.github.io
+// ====== CONFIG ======
+const {
+  GITHUB_CLIENT_ID,
+  GITHUB_CLIENT_SECRET,
+  REPO_FULL_NAME,            // es: "DaniAlcq/asd-volley-96" (facoltativo)
+  ALLOWED_ORIGIN,            // es: "https://danialcq.github.io"
+  COOKIE_SECRET = 'cms_oauth_cookie_secret'
+} = process.env;
+
+// CORS: consenti il tuo sito (l'origin è schema+host+porta, niente path)
 app.use(cors({
   origin: (origin, cb) => {
-    if (!ALLOWED_ORIGIN) return cb(null, true); // fallback: accetta tutti
-    try {
-      const allowed = new URL(ALLOWED_ORIGIN).origin;
-      if (!origin || new URL(origin).origin === allowed) return cb(null, true);
-      return cb(new Error('Not allowed by CORS'));
-    } catch {
-      return cb(null, false);
-    }
+    if (!origin) return cb(null, true);             // per richieste server-to-server
+    if (!ALLOWED_ORIGIN) return cb(null, true);      // permissivo finché configuri
+    if (origin === ALLOWED_ORIGIN) return cb(null, true);
+    return cb(new Error(`Origin non consentito: ${origin}`));
   },
   credentials: true
 }));
 
-// Env richieste
-const {
-  GITHUB_CLIENT_ID,
-  GITHUB_CLIENT_SECRET,
-  REPO_FULL_NAME // "DaniAlcq/asd-volley-96"
-} = process.env;
+// Utility per state anti-CSRF
+function makeState() {
+  return crypto.randomBytes(16).toString('hex');
+}
 
-// Health check
-app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up'));
-app.get('/health', (req, res) => res.json({
-  ok: true,
-  hasClientId: !!GITHUB_CLIENT_ID,
-  hasSecret: !!GITHUB_CLIENT_SECRET,
-  repo: REPO_FULL_NAME,
-  allowedOrigin: ALLOWED_ORIGIN
-}));
+// Health
+app.get('/', (req, res) => res.send('OK: volley96-auth-proxy up (OAuth web flow)'));
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    hasClientId: !!GITHUB_CLIENT_ID,
+    hasSecret: !!GITHUB_CLIENT_SECRET,
+    repo: REPO_FULL_NAME || null,
+    allowedOrigin: ALLOWED_ORIGIN || '* (dev)'
+  });
+});
 
 /**
- * Avvio login per Decap CMS (GitHub backend) via Device Flow
+ * 1) Avvio login: reindirizza a GitHub OAuth authorize
+ *    Decap CMS aprirà questo endpoint in un popup.
+ *    Query utili: ?origin=<url admin> (Decap la passa; la teniamo per sicurezza)
  */
-app.get('/auth/github', async (req, res) => {
+app.get('/auth/github', (req, res) => {
   try {
-    // ricava origin da query o header
-    const origin =
-      req.query.origin ||
-      req.headers.origin ||
-      (req.headers.referer ? new URL(req.headers.referer).origin : null);
-
-    console.log('Login request from origin:', origin);
-
-    // Richiesta device code a GitHub
-    const deviceResp = await fetch('https://github.com/login/device/code', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, scope: 'repo' })
-    });
-    const deviceData = await deviceResp.json();
-
-    if (!deviceResp.ok) {
-      console.error('Device code error:', deviceData);
-      return res.status(500).json({ error: 'device_code_failed', details: deviceData });
+    const origin = req.query.origin || ALLOWED_ORIGIN; // es. https://danialcq.github.io
+    if (!origin) {
+      return res.status(400).send('Missing origin (configura ALLOWED_ORIGIN o passa ?origin=...)');
     }
 
-    // Risposta per Decap CMS
-    res.json({
-      provider: 'github',
-      token: deviceData.device_code,
-      verification_uri: deviceData.verification_uri,
-      user_code: deviceData.user_code,
-      expires_in: deviceData.expires_in,
-      interval: deviceData.interval,
-      origin: origin || null
+    // genera state e salvalo in cookie (httpOnly false perché usiamo popup; va bene per questo caso)
+    const state = makeState();
+    res.cookie('oauth_state', state, { httpOnly: true, sameSite: 'lax', secure: true });
+    res.cookie('cms_origin', origin, { httpOnly: true, sameSite: 'lax', secure: true });
+
+    const params = new URLSearchParams({
+      client_id: GITHUB_CLIENT_ID,
+      scope: 'repo',
+      state,
+      // Deve puntare al tuo /callback pubblico
+      redirect_uri: `https://${req.get('host')}/callback`
     });
+
+    const authorizeUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+    return res.redirect(authorizeUrl);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'auth_init_failed' });
+    res.status(500).send('auth init failed');
   }
 });
 
 /**
- * Scambio device_code -> access_token
+ * 2) Callback da GitHub: scambia code -> access_token e “consegna” il token al CMS
+ *    tramite postMessage dal popup verso la finestra principale, poi chiude il popup.
  */
-app.post('/auth/github/callback', async (req, res) => {
+app.get('/callback', async (req, res) => {
   try {
-    const { token: device_code } = req.body || {};
-    if (!device_code) return res.status(400).json({ error: 'missing device_code' });
+    const { code, state } = req.query;
+    const savedState = req.cookies.oauth_state;
+    const origin = req.cookies.cms_origin || ALLOWED_ORIGIN;
 
+    if (!code || !state) return res.status(400).send('Missing code/state');
+    if (state !== savedState) return res.status(400).send('Invalid state');
+
+    // scambia code per access_token
     const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({
         client_id: GITHUB_CLIENT_ID,
         client_secret: GITHUB_CLIENT_SECRET,
-        device_code,
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
+        code,
+        redirect_uri: `https://${req.get('host')}/callback`,
+        state
       })
     });
     const tokenData = await tokenResp.json();
 
-    if (!tokenResp.ok || tokenData.error) {
+    if (!tokenResp.ok || tokenData.error || !tokenData.access_token) {
       console.error('Token exchange error:', tokenData);
-      return res.status(400).json(tokenData);
+      return res.status(400).send('Token exchange failed');
     }
 
-    res.json({
-      token: tokenData.access_token,
-      provider: 'github'
-    });
+    const accessToken = tokenData.access_token;
+
+    // Pagina HTML che comunica il token al CMS e chiude il popup
+    // Decap si aspetta un postMessage con { token, provider: 'github' }
+    const target = origin || '*';
+    const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>GitHub OAuth Done</title></head>
+<body>
+<script>
+  (function(){
+    try {
+      var data = { token: ${JSON.stringify(accessToken)}, provider: 'github' };
+      if (window.opener) {
+        window.opener.postMessage(data, ${JSON.stringify(target)});
+        window.close();
+      } else if (window.parent) {
+        window.parent.postMessage(data, ${JSON.stringify(target)});
+      }
+    } catch(e) {
+      console.error(e);
+    }
+  })();
+</script>
+<p>Login completato. Puoi chiudere questa finestra.</p>
+</body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(html);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'token_exchange_failed' });
+    res.status(500).send('callback failed');
   }
 });
 
-// Compatibilità fallback
-app.get('/callback', (req, res) => {
-  res.send('Callback ok (non usata nel device flow).');
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Auth proxy listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Auth proxy listening on :${PORT}`));
